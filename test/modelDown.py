@@ -3,7 +3,7 @@ import torchvision.models as models
 model_dict = models.__dict__
 
 for k in model_dict.keys():
-    print(f"Trying to calling {k}...", end='')
+    print(f"Trying to call {k}...", end='')
     try:
         md = getattr(models, k)
         md(pretrained=True)
