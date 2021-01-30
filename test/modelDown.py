@@ -8,9 +8,7 @@ for k in model_dict.keys():
         md = getattr(models, k)
         md(pretrained=True)
         print('done!')
-    except TypeError:
-        print(f": Not a model")
-        continue
-    except ValueError:
-        print(f": No available repository")
+    except TypeError: print(": Not a model")
+    except ValueError: print(": No available repository")
+    except NotImplementedError: print(": No available parameters")
 
