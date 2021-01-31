@@ -13,9 +13,9 @@ from colorama import Fore
 from tqdm import tqdm
 from tqdm.utils import _term_move_up
 
-from .dataset import SleepMAIC
-from .loss import F1Loss
-from .transforms import RandomContrast, RandomGamma
+from dataset import SleepMAIC
+from loss import F1Loss
+from transforms import RandomContrast, RandomGamma
 
 
 class TrainNet():

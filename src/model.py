@@ -4,7 +4,7 @@ Model structures
 from torch import nn
 from torch.nn import functional as F
 
-from . import layers
+import layers
 
 
 class ForTest(nn.Module):
