@@ -1,165 +1,137 @@
+# basics
 import os
 import logging
-from numpy.lib.arraysetops import isin
 
+# pytorch
 import torch
+from torch import nn
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from torchvision import datasets, transforms
 
-import numpy as np
+# tools
+from numpy.lib.arraysetops import isin
 from colorama import Fore
 from tqdm import tqdm
 from tqdm.utils import _term_move_up
 
+# self written libs
+import loss
+from scores import F1Score
 from dataset import SleepMAIC
-from loss import F1Loss
 from transforms import RandomContrast, RandomGamma
-
 
 class TrainNet():
     # test loss, pnsr, ssim
-    scores = -1, -1, -1
-    b_scores = -1, -1
+    _losses = -1
+    _scores = -1
     dtype = torch.float
 
     def __init__(self, nets, optims, device_main, config):
-        self.encoder = nets[0]
-        self.decoder = nets[1]
-        
-        self.optim_encoder = optims[0][0]
-        self.optim_decoder = optims[1][0]
-        self.scheduler_encoder = optims[0][1]
-        self.scheduler_decoder = optims[1][1]
+        '''
+        Input
+        -----
+        nets: list of networks
+        optims: list of (optimizer, scheduler)
+        '''
+        self.net = nets[0]
+        self.optim = optims[0][0]
+        self.scheduler = optims[0][1]
+        self.device_main = device_main
 
-        self.dvc_main = device_main
-        self.config = config
-        self.dir_sv = config['SAVE']['dir_save']
+        self.cfg_dft = config['DEFAULT']
+        self.cfg_train = config['TRAIN']
+        self.cfg_model = config['MODEL']
+        self.cfg_dt = config['DATASET']
+        self.cfg_sv = config['SAVE']
 
-        self.num_epoch = int(config['TRAIN']['num_epoch'])
+        self.name_loss = self.cfg_train['loss']
 
-        # dir_train = config['DATASET']['dir_train']
-        # dir_valin = config['DATASET']['dir_valid']
-        
-        if config['DATASET']['data'] == 'sample':
+        self.dir_sv = self.cfg_sv['dir_save']
+        self.num_epoch = int(self.cfg_train['num_epoch'])
+
+        if self.cfg_dt['name'] == 'Sleep':
+            lst_train = eval(self.cfg_dt['lst_train'])
+            lst_valid = eval(self.cfg_dt['lst_valid'])
             transform = transforms.Compose([
                 transforms.ToTensor(),
             ])
-            data_train = datasets.MNIST(
-                config['DATASET']['root_dataset'],
-                train=True, download=True, transform=transform)
-            data_valid = datasets.MNIST(
-                config['DATASET']['root_dataset'],
-                train=False, download=True, transform=transform)
-        elif config['DATASET']['data'] == 'teeth_cropped_ext':
-            sz = (int(config['MODEL']['H']), int(config['MODEL']['W']))
-            transform_train = transforms.Compose([
-                RandomGamma(p=.75),
-            ])
-            transform_target = None
-            transform = transforms.Compose([
-                transforms.RandomHorizontalFlip(p=.5),
-                transforms.Resize(sz),
-                transforms.ToTensor(),
-            ])
-            data_train = TeethCroppedExt(
-                config['DATASET']['root_dataset'], 
-                split='train', transform=transform,
-                transform_train=transform_train)
-            data_valid = TeethCroppedExt(
-                config['DATASET']['root_dataset'], 
-                split='test', transform=transform,
-                transform_train=transform_train)
-
+            data_train = SleepMAIC(
+                self.cfg_dt['path'], split=lst_train, transform=transform)
+            data_valid = SleepMAIC(
+                self.cfg_dt['path'], split=lst_valid, transform=transform)
+        else:
+            raise NotImplemented('There are no such dataset')
+                
         self.n_train, self.n_valid = len(data_train), len(data_valid)
         self.loader_train = DataLoader(
             data_train, 
-            batch_size=int(config['TRAIN']['train_batch_size']), 
-            shuffle=True, num_workers=int(config['TRAIN']['num_workers']), 
+            batch_size=int(self.cfg_train['train_batch_size']), 
+            shuffle=True, num_workers=int(self.cfg_train['num_workers']), 
             pin_memory=True
         )
         self.loader_valid = DataLoader(
             data_valid, 
-            batch_size=int(config['TRAIN']['valid_batch_size']), 
-            shuffle=False, num_workers=int(config['TRAIN']['num_workers']),
+            batch_size=int(self.cfg_train['valid_batch_size']), 
+            shuffle=False, num_workers=int(self.cfg_train['num_workers']),
             pin_memory=True
         )
-        self.writer_main = SummaryWriter(log_dir=os.path.join(self.dir_sv, f'tb_logs/main'))
-        self.writer_test = SummaryWriter(log_dir=os.path.join(self.dir_sv, f'tb_logs/test'))
+        self.writer_main = SummaryWriter(log_dir=os.path.join(self.dir_sv, f'tb_logs/train'))
+        self.writer_test = SummaryWriter(log_dir=os.path.join(self.dir_sv, f'tb_logs/valid'))
 
         logging.info("Starting training...")
         
         for n, p in self.encoder.named_parameters():
-            if not p.requires_grad: logging.info(f"[Encoder] {n} : {p.requires_grad}")
-        for n, p in self.decoder.named_parameters():
-            if not p.requires_grad: logging.info(f"[Decoder] {n} : {p.requires_grad}")
+            if not p.requires_grad: logging.info(f"[Parameters] {n} : {p.requires_grad}")
 
         try:
-            _ct = __import__('torch.nn', fromlist=[config['TRAIN']['loss']])
-            self.criterion = getattr(_ct, config['TRAIN']['loss'])()
+            self.criterion = getattr(nn, self.name_loss)()
         except AttributeError:
-            _ct = __import__('src.loss', fromlist=[config['TRAIN']['loss']])
-            self.criterion = getattr(_ct, config['TRAIN']['loss'])()
+            self.criterion = getattr(loss, self.name_loss)()
 
 
     def training(self, epoch):
         pbar = tqdm(total=self.n_train, desc=f'Epoch {epoch + 1}/{self.num_epoch}', unit='img',
             bar_format='{l_bar}%s{bar:10}%s{r_bar}{bar:-10b}' % (Fore.RED, Fore.RESET))
-        mean_loss, mean_score = 0, [0, 0]
+        mean_loss, mean_score = 0, 0
 
-        self.encoder.train()
-        self.decoder.train()
-        for k, BCH in enumerate(self.loader_train):
-            imgs = BCH[0].to(device=self.dvc_main, dtype=self.dtype)
-            labels = BCH[0].to(device=self.dvc_main, dtype=self.dtype)
+        self.net.train()
+        n_iter = len(self.loader_train)
+        for k, btchs in enumerate(self.loader_train):
+            imgs = btchs[0].to(device=self.dvc_main, dtype=self.dtype)
+            labels = btchs[1].to(device=self.dvc_main, dtype=self.dtype)
 
-            self.scheduler_encoder.step(epoch + k / len(self.loader_train))
-            self.scheduler_decoder.step(epoch + k / len(self.loader_train))
+            self.scheduler.step(epoch + k / n_iter)
+            self.optim.zero_grad()
 
-            self.optim_encoder.zero_grad()
-            self.optim_decoder.zero_grad()
-
-            if 'VAELoss' in self.config['TRAIN']['loss']:
-                l, mu, sig = self.encoder(imgs)
-                output = self.decoder(l)
-                loss = self.criterion(output, labels, mu, sig)
-            else:
-                l = self.encoder(imgs)
-                output = self.decoder(l)
-                loss = self.criterion(output, labels)
+            preds = self.net(imgs)
+            loss = self.criterion(preds, labels)
             loss.backward()
 
-            self.optim_encoder.step()
-            self.optim_decoder.step()
+            self.optim.step()
 
             with torch.no_grad():
                 img_dt = imgs.data
                 label_dt = labels.data
-                output_dt = output.data
-                labels_sum = img_dt - label_dt
-                output_sum = img_dt - output_dt
-                mean_score[0] += PSNR(labels, output).item()
-                mean_score[1] += SSIM(labels, output)[0].item()
+                pred_dt = preds.data
+
+                mean_score += F1Score(pred_dt, label_dt)
                 mean_loss += loss.item()
 
-                lrs = f"{self.scheduler_encoder.get_last_lr()[0]:.3f}, {self.scheduler_decoder.get_last_lr()[0]:.3f}"
-                pbar.set_postfix(**{'Loss': mean_loss / (k + 1),
-                                    'PSNR': mean_score[0] / (k + 1),
-                                    'SSIM': mean_score[1] / (k + 1),
+                lrs = f"{self.scheduler.get_last_lr()[0]:.3f}"
+                pbar.set_postfix(**{self.name_loss: mean_loss / (k + 1),
+                                    'F1Score': mean_score / (k + 1),
                                     'LRs' : lrs})
                 pbar.update(imgs.shape[0])
                 if k == 0:
                     img_dict = {'Train/': img_dt,
                                 'Train/true': label_dt,
-                                'Train/true_sum': labels_sum,
-                                'Train/pred': output_dt,
-                                'Train/pred_sum': output_sum}
+                                'Train/pred': pred_dt}
                     self.writing(epoch, self.writer_main, img_dict, opt='image')
-                    
-        scalar_dict = {'Loss': mean_loss / (k + 1),
-                        'Score/PSNR': mean_score[0] / (k + 1),
-                        'Score/SSIM': mean_score[1] / (k + 1)}
+        
+        scalar_dict = {self.name_loss: mean_loss / (n_iter + 1),
+                        'F1Score': mean_score / (n_iter + 1)}
         pbar.write(_term_move_up(), end='\r')
         self.writing(epoch, self.writer_main, scalar_dict, opt='scalar')
         pbar.close()
@@ -169,84 +141,67 @@ class TrainNet():
             bar_format='{l_bar}%s{bar:10}%s{r_bar}{bar:-10b}' % (Fore.BLUE, Fore.RESET))
         mean_loss, mean_score = 0, [0, 0]
 
-        self.encoder.eval()
-        self.decoder.eval()
+        self.net.eval()
+        n_iter = len(self.loader_valid)
         with torch.no_grad():
-            for k, BCH in enumerate(self.loader_valid):
-                imgs = BCH[0].to(device=self.dvc_main, dtype=self.dtype)
-                labels = BCH[0].to(device=self.dvc_main, dtype=self.dtype)
+            for k, btchs in enumerate(self.loader_valid):
+                imgs = btchs[0].to(device=self.dvc_main, dtype=self.dtype)
+                labels = btchs[1].to(device=self.dvc_main, dtype=self.dtype)
 
-                if 'VAELoss' in self.config['TRAIN']['loss']:
-                    l, mu, sig = self.encoder(imgs)
-                    output = self.decoder(l)
-                    loss = self.criterion(output, labels, mu, sig)
-                else:
-                    l = self.encoder(imgs)
-                    output = self.decoder(l)
-                    loss = self.criterion(output, labels)
+                preds = self.net(imgs)
+                loss = self.criterion(preds, labels)
             
                 img_dt = imgs.data
                 label_dt = labels.data
-                output_dt = output.data
+                pred_dt = preds.data
 
-                labels_sum = img_dt - label_dt
-                output_sum = img_dt - output_dt
-                mean_score[0] += PSNR(label_dt, output_dt).item()
-                mean_score[1] += SSIM(label_dt, output_dt)[0].item()
+                mean_score += F1Score(pred_dt, label_dt)
                 mean_loss += loss.item()
 
-                pbar.set_postfix(**{'Loss': mean_loss / (k + 1),
-                                    'PSNR': mean_score[0] / (k + 1),
-                                    'SSIM': mean_score[1] / (k + 1)})
+                pbar.set_postfix(**{self.name_loss: mean_loss / (k + 1),
+                                    'F1Score': mean_score / (k + 1)})
                 pbar.update(imgs.shape[0])
 
                 if k == 0:
-                    # if epoch == 0:
                     init_dict = {f'Test{k}/': img_dt,
-                                f'Test{k}/true': label_dt,
-                                f'Test{k}/true_sum': labels_sum}
+                                f'Test{k}/true': label_dt}
                     self.writing(epoch, self.writer_test, init_dict, opt='image')
-                    img_dict = {f'Test{k}/pred': output_dt,
-                                f'Test{k}/pred_sum': output_sum}
-                    self.writing(epoch, self.writer_test, img_dict, opt='image')
-        scalar_dict = {'Loss': mean_loss / (k + 1),
-                        'Score/PSNR': mean_score[0] / (k + 1),
-                        'Score/SSIM': mean_score[1] / (k + 1)}
+                img_dict = {f'Test{k}/pred': pred_dt}
+                self.writing(epoch, self.writer_test, img_dict, opt='image')
+        
+        self.scalar_dict = {self.name_loss: mean_loss / (n_iter + 1),
+                            'F1Score': mean_score / (n_iter + 1)}
         pbar.close()
-        self.writing(epoch, self.writer_test, scalar_dict, opt='scalar')
-        self.scores = (mean_loss / (k + 1), mean_score[0] / (k + 1), mean_score[1] / (k + 1))
+        self.writing(epoch, self.writer_test, self.scalar_dict, opt='scalar')
 
     def saving(self, epoch):
-        dir_sv = self.config['SAVE']['dir_save']
-        dir_cp = os.path.join(dir_sv, 'checkpoints/')
-        term_sv = int(self.config['SAVE']['term_save'])
+        dir_cp = os.path.join(self.dir_sv, 'checkpoints/')
+        term_sv = int(self.cfg_sv['term_save'])
         try:
             os.mkdir(dir_cp)
             logging.info('Created checkpoint directory')
         except OSError:
             pass
+
+        # if we are in save term or validation score hit a new peak.
         _indic = {
             epoch: (epoch % term_sv == 0) or (epoch == self.num_epoch - 1),
-            'SSIM': self.b_scores[0] < self.scores[1],
-            'PSNR': self.b_scores[1] < self.scores[2]
+            'F1_Score': self._scores < self.scalar_dict['F1Score']
         }
         if any(_indic.values()):
             torch.save({
-                    'encoder_state_dict': self.encoder.state_dict(),
-                    'decoder_state_dict': self.decoder.state_dict(),
-                    'optim_encoder_state_dict': self.optim_encoder.state_dict(),
-                    'optim_decoder_state_dict': self.optim_decoder.state_dict(),
-                    }, os.path.join(dir_cp,'temp'))
+                    'net_state_dict': self.net.state_dict(),
+                    'optim_state_dict': self.optim.state_dict(),
+                    }, os.path.join(dir_cp, 'temp'))
             logging.info(f'''Checkpoint {epoch} saved !!
-                    {self.config['TRAIN']['loss']}\t\t: {self.scores[0]}
-                    PSNR        : {self.scores[1]}
-                    SSIM        : {self.scores[2]}
-            ''')
+                    self.name_loss\t: {self.scalar_dict[self.name_loss]}
+                    F1Score\t: {self.scalar_dict['F1Score']}''')
+
             for k, v in _indic.items():
                 if v:
                     name_sv = os.path.join(dir_cp, f"CP_{k}.pth")
                     os.system(f"cp {os.path.join(dir_cp,'temp')} {name_sv}")
-        self.b_scores = max(self.b_scores[0], self.scores[1]), max(self.b_scores[1], self.scores[2])
+        self._scores = max(self._scores, self.scalar_dict['F1Score'])
                 
     @staticmethod
     def writing(epoch, writer, tb_dict, opt):

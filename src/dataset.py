@@ -2,14 +2,11 @@
 data loader {img, label}
 '''
 import logging
-import os
-import pickle
-from glob import glob
-from time import time
+from os.path import join
 
-from tqdm import tqdm
+import pandas as pd
 from PIL import Image
-import numpy as np
+import pickle
 from torch.utils.data import Dataset
 
 
@@ -17,46 +14,36 @@ class SleepMAIC(Dataset):
     '''
     make a list of data
     '''
-    preset = {'train': (0, 700), 'valid': (701, 800), 'test': (0, 200)}
+    def __init__(self, dir_data, split, transform):
+        
+        # self.dir_data = dir_data
+        # self.split = split
+        # self.transform = transform
 
-    def __init__(self, dir_data, type_data, transform, transform_train=None, transform_target=None):
-        self.dir_data = dir_data
-        self.transform = transform
-        self.transform_train = transform_train
-        self.transform_target = transform_target
+        # # load data information from .csv file
+        # info_train = pd.read_csv(join(self.dir_data, "trainset-for_user.csv"),
+        #     names=['cases', 'datapoints', 'labels'])
+        # css = info_train.loc[:, 'cases']
+        # sz_css = css.value_counts()
 
-        # total file list
-        total_files =[os.path.splitext(file) for file in os.listdir(dir_data)]
+        # init_idx = sz_css.iloc[:split[0]].sum()
+        # end_idx = sz_css.iloc[:split[1]].sum()
+        # self.use_files = info_train[init_idx:end_idx]
 
-        # files with <type_data>
-        _tp = self.preset[type_data]
-        self.files = [
-            tfs for tfs in total_files
-            if int(tfs[0][-4:]) >= _tp[0]
-            and int(tfs[0][-4:]) < _tp[1]
-        ]
-        logging.info(f'Creating dataset with {len(self.files)} examples')
+        preset = {range(0, 700): 'train_0700', range(700, 796): 'train_700796'}
+
+        with open(join(self.dir_data, preset[split]), 'rb') as f:
+            self.use_file = pickle.load(f)
+
+        logging.info(f'Creating dataset with {len(self.use_files)} examples')
 
     def __len__(self):
-        return len(self.files)
+        return len(self.use_files)
 
     def __getitem__(self, index):
-        name_file = self.files[index][0]
-        ext_file = self.files[index][1]
-        path_file = os.path.join(self.dir_data, name_file + ext_file)
-
         # load file
-        img = Image.open(path_file).convert('L')
-        #===============================
-        # To be implemented
-        label = 0
-        #===============================
-
-        # doing this so that it is consistent with all other datasets
-        # to return a PIL Image
-        if isinstance(img, np.ndarray):
-            img = 255 * img / img.max()
-            img = Image.fromarray(img.astype('uint8'), mode='L')
+        case, datapoint, label = self.use_files.iloc[index]
+        img = Image.open(join(self.dir_data, *[case, datapoint])).convert('L')
 
         # transformimg data
         input = self.transform(img)
