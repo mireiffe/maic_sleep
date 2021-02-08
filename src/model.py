@@ -6,7 +6,7 @@ from torch.nn import functional as F
 from torchvision import models
 
 import layers
-
+from msresnet import MSResNet
 
 class ForTest(nn.Module):
     def __init__(self, in_ch, out_ch):
@@ -33,3 +33,12 @@ class resnet50(nn.Module):
 
     def forward(self, x):
         self.resnet50(x)
+
+class patternNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+        self.msresnet = MSResNet(1)
+
+    def forward(self, x):
+        return self.msresnet(x)
